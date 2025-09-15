@@ -4992,7 +4992,7 @@ exit:
 	return rc ?: count;
 }
 
-static DEVICE_ATTR(dsi_display_hbm, 0644, sysfs_hbm_read, sysfs_hbm_write);
+static DEVICE_ATTR(hbm, 0644, sysfs_hbm_read, sysfs_hbm_write);
 
 static ssize_t sysfs_fod_hbm_read(struct device *dev,
 				  struct device_attribute *attr,
@@ -5085,12 +5085,12 @@ exit:
 	return rc ?: count;
 }
 
-static DEVICE_ATTR(dsi_display_dc, 0644, sysfs_dc_dimming_read, sysfs_dc_dimming_write);
+static DEVICE_ATTR(dc, 0644, sysfs_dc_dimming_read, sysfs_dc_dimming_write);
 
 static struct attribute *panel_attrs[] = {
-	&dev_attr_dsi_display_hbm.attr,
+	&dev_attr_hbm.attr,
 	&dev_attr_fod_hbm.attr,
-	&dev_attr_dsi_display_dc.attr,
+	&dev_attr_dc.attr,
 	NULL,
 };
 
