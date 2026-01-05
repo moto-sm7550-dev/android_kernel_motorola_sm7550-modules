@@ -17,25 +17,6 @@
 #include <linux/cpumask.h>
 #include <linux/version.h>
 
-#ifdef CONFIG_ZRAM_5_4
-#include "../zram-5.4/zram_drv.h"
-#include "../zram-5.4/zram_drv_internal.h"
-#define MEMCG_OEM_DATA(memcg) ((memcg)->android_oem_data1)
-#elif defined CONFIG_ZRAM_5_15
-#include "../zram-5.15/zram_drv.h"
-#include "../zram-5.15/zram_drv_internal.h"
-#define BIO_MAX_PAGES BIO_MAX_VECS
-#define MEMCG_OEM_DATA(memcg) ((memcg)->android_oem_data1[0])
-#elif defined CONFIG_ZRAM_6_1
-#include "../zram-6.1/zram_drv.h"
-#include "../zram-6.1/zram_drv_internal.h"
-#define BIO_MAX_PAGES BIO_MAX_VECS
-#define MEMCG_OEM_DATA(memcg) ((memcg)->android_oem_data1[0])
-#else
-#include "../zram-5.10/zram_drv.h"
-#include "../zram-5.10/zram_drv_internal.h"
-#define MEMCG_OEM_DATA(memcg) ((memcg)->android_oem_data1)
-#endif
 #include "hybridswap_internal.h"
 
 #define MOTO_SWAP_VERSION 3
@@ -226,6 +207,8 @@ static ssize_t usable_mem_params_write(struct kernfs_open_file *of,
 		atomic_set(&refresh_daemoninit_flag, 0);
 	else
 		atomic_set(&refresh_daemoninit_flag, 1);
+
+	fetch_totalreserve_pages(); // update totalreserve_pages
 
 	wake_all_swapd();
 
@@ -698,7 +681,7 @@ static int memcg_active_app_info_list_show(struct seq_file *m, void *v)
 	return 0;
 }
 
-static unsigned long fetch_totalreserve_pages(void)
+unsigned long fetch_totalreserve_pages(void)
 {
 	int nid;
 	unsigned long val = 0;
@@ -709,6 +692,10 @@ static unsigned long fetch_totalreserve_pages(void)
 		if (pgdat)
 			val += pgdat->totalreserve_pages;
 	}
+
+	// limit the totalreserve_pages.
+	if (val > 25000)
+		val = 25000;
 
 	return val;
 }
