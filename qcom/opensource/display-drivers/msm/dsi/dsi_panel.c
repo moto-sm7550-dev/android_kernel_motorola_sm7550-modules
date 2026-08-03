@@ -10,6 +10,7 @@
 #include <linux/of_gpio.h>
 #include <linux/pwm.h>
 #include <video/mipi_display.h>
+#include <linux/ctype.h>
 
 #if defined(CONFIG_PANEL_NOTIFICATIONS)
 #include <linux/panel_notifier.h>
@@ -2780,7 +2781,7 @@ int dsi_panel_get_cmd_pkt_count(const char *data, u32 length, u32 *cnt)
 
 	while (length >= cmd_set_min_size) {
 		packet_length = cmd_set_min_size;
-		tmp = ((data[5] << 8) | (data[6]));
+		tmp = (((u8)data[5] << 8) | (u8)data[6]);
 		packet_length += tmp;
 		if (packet_length > length) {
 			DSI_ERR("format error\n");
@@ -2812,7 +2813,7 @@ int dsi_panel_create_cmd_packets(const char *data,
 		cmd[i].msg.flags |= data[3];
 		cmd[i].ctrl = 0;
 		cmd[i].post_wait_ms = data[4];
-		cmd[i].msg.tx_len = ((data[5] << 8) | (data[6]));
+		cmd[i].msg.tx_len = (((u8)data[5] << 8) | (u8)data[6]);
 
 		if (cmd[i].msg.flags & MIPI_DSI_MSG_BATCH_COMMAND)
 			cmd[i].last_command = false;
@@ -5087,10 +5088,211 @@ exit:
 
 static DEVICE_ATTR(dc, 0644, sysfs_dc_dimming_read, sysfs_dc_dimming_write);
 
+#define DSI_CUSTOM_CMD_MAX_BYTES	4096
+#define DSI_CUSTOM_CMD_HDR_SIZE		7
+
+static int dsi_panel_parse_custom_hex(const char *buf, size_t count,
+				      u8 **out, size_t *out_len)
+{
+	u8 *data;
+	size_t i = 0;
+	size_t len = 0;
+	int hi, lo;
+
+	if (!buf || !out || !out_len)
+		return -EINVAL;
+
+	if (count == 0 || count > PAGE_SIZE)
+		return -EINVAL;
+
+	data = kzalloc(DSI_CUSTOM_CMD_MAX_BYTES, GFP_KERNEL);
+	if (!data)
+		return -ENOMEM;
+
+	while (i < count) {
+		while (i < count && isspace(buf[i]))
+			i++;
+
+		if (i >= count)
+			break;
+
+		if (len >= DSI_CUSTOM_CMD_MAX_BYTES) {
+			kfree(data);
+			return -E2BIG;
+		}
+
+		hi = hex_to_bin(buf[i++]);
+		if (hi < 0 || i >= count) {
+			kfree(data);
+			return -EINVAL;
+		}
+
+		/*
+		 * The two nibbles of a byte must be adjacent.
+		 * For example, "5 1" is invalid; use "51".
+		 */
+		lo = hex_to_bin(buf[i++]);
+		if (lo < 0) {
+			kfree(data);
+			return -EINVAL;
+		}
+
+		data[len++] = (hi << 4) | lo;
+
+		/*
+		 * Only whitespace or another hex byte may follow.
+		 * This rejects formats such as "0x51".
+		 */
+		if (i < count && !isspace(buf[i]) &&
+		    hex_to_bin(buf[i]) < 0) {
+			kfree(data);
+			return -EINVAL;
+		}
+	}
+
+	if (!len) {
+		kfree(data);
+		return -EINVAL;
+	}
+
+	*out = data;
+	*out_len = len;
+	return 0;
+}
+
+static int dsi_panel_validate_custom_packets(const u8 *data, size_t len,
+					     u32 *packet_count)
+{
+	size_t offset = 0;
+	u32 count = 0;
+	u16 payload_len;
+
+	if (!data || !len || !packet_count)
+		return -EINVAL;
+
+	while (offset < len) {
+		if (len - offset < DSI_CUSTOM_CMD_HDR_SIZE)
+			return -EINVAL;
+
+		payload_len = ((u16)data[offset + 5] << 8) |
+			     data[offset + 6];
+
+		if (payload_len == 0)
+			return -EINVAL;
+
+		if (payload_len > len - offset - DSI_CUSTOM_CMD_HDR_SIZE)
+			return -EINVAL;
+
+		offset += DSI_CUSTOM_CMD_HDR_SIZE + payload_len;
+		count++;
+
+		if (count > 128)
+			return -E2BIG;
+	}
+
+	if (offset != len || !count)
+		return -EINVAL;
+
+	*packet_count = count;
+	return 0;
+}
+
+static int dsi_panel_send_custom_packets(struct dsi_panel *panel,
+					 const u8 *data, size_t len)
+{
+	struct dsi_cmd_desc *cmds;
+	u32 packet_count;
+	u32 i;
+	int rc;
+	ssize_t transfer_len;
+
+	if (!panel || !panel->host || !panel->cur_mode)
+		return -ENODEV;
+
+	if (!panel->panel_initialized)
+		return -EPIPE;
+
+	rc = dsi_panel_validate_custom_packets(data, len, &packet_count);
+	if (rc)
+		return rc;
+
+	cmds = kcalloc(packet_count, sizeof(*cmds), GFP_KERNEL);
+	if (!cmds)
+		return -ENOMEM;
+
+	rc = dsi_panel_create_cmd_packets((const char *)data, len,
+					  packet_count, cmds);
+	if (rc)
+		goto free_cmds;
+
+	for (i = 0; i < packet_count; i++) {
+		cmds[i].ctrl_flags = 0;
+
+		transfer_len = dsi_host_transfer_sub(panel->host, &cmds[i]);
+		if (transfer_len < 0) {
+			rc = transfer_len;
+			DSI_ERR("[%s] custom DSI command %u failed, rc=%d\n",
+				panel->name, i, rc);
+			goto destroy_cmds;
+		}
+
+		if (cmds[i].post_wait_ms)
+			usleep_range(cmds[i].post_wait_ms * 1000,
+				     cmds[i].post_wait_ms * 1000 + 10);
+	}
+
+	rc = 0;
+	goto destroy_cmds;
+
+destroy_cmds:
+	for (i = 0; i < packet_count; i++)
+		kfree(cmds[i].msg.tx_buf);
+free_cmds:
+	kfree(cmds);
+	return rc;
+}
+
+static ssize_t sysfs_custom_dsi_cmd_write(struct device *dev,
+					  struct device_attribute *attr,
+					  const char *buf, size_t count)
+{
+	struct dsi_display *display;
+	struct dsi_panel *panel;
+	u8 *data = NULL;
+	size_t data_len = 0;
+	int rc;
+
+	display = dev_get_drvdata(dev);
+	if (!display || !display->panel)
+		return -ENODEV;
+
+	panel = display->panel;
+
+	rc = dsi_panel_parse_custom_hex(buf, count, &data, &data_len);
+	if (rc)
+		return rc;
+
+	/*
+	 * Serialize this with normal panel command traffic, brightness,
+	 * HBM, mode switching, ESD recovery, etc.
+	 */
+	mutex_lock(&panel->panel_lock);
+	rc = dsi_panel_send_custom_packets(panel, data, data_len);
+	mutex_unlock(&panel->panel_lock);
+
+	kfree(data);
+
+	return rc ? rc : count;
+}
+
+static DEVICE_ATTR(custom_dsi_cmd, 0200, NULL,
+		   sysfs_custom_dsi_cmd_write);
+
 static struct attribute *panel_attrs[] = {
 	&dev_attr_hbm.attr,
 	&dev_attr_fod_hbm.attr,
 	&dev_attr_dc.attr,
+	&dev_attr_custom_dsi_cmd.attr,
 	NULL,
 };
 
